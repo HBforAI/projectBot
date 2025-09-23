@@ -16,6 +16,9 @@ LangGraph 기반 프로젝트 인원 추천 에이전트
 """
 
 from typing import Dict, List, Any, TypedDict, Annotated
+from pydantic import BaseModel, Field, ValidationError
+from langchain.output_parsers import PydanticOutputParser
+from langchain.prompts import PromptTemplate
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
@@ -35,6 +38,20 @@ class AgentState(TypedDict):
     user_request: str                        # 사용자 요청 내용
     recommendations: List[Dict[str, Any]]    # 추천 결과 리스트
     analysis_complete: bool                  # 분석 완료 여부
+    analysis: Dict[str, Any]                 # 구조화된 분석 결과
+
+class RequestAnalysis(BaseModel):
+    """사용자 요청 분석 결과 (구조화)"""
+    project_characteristics: str = Field(
+        description="프로젝트의 목적과 분야, 그리고 도메인은 무엇인지에 대한 설명"
+    )
+    tags: List[str] = Field(
+        default_factory=list,
+        description="프로젝트의 도메인/분야를 나타내는 태그 목록 (예: HR, 거시경제, 바이오)"
+    )
+    required_capabilities: str = Field(
+        description="프로젝트 수행을 위해 필요해 보이는 역량에 대한 설명"
+    )
 
 class ProjectRecommendationAgent:
     """
@@ -94,6 +111,7 @@ class ProjectRecommendationAgent:
         
         return workflow.compile()
     
+    # TODO: 이거 Output Extraction 통해서 1~4번 다 분리해서 받고, calculate_participant_suitability 함수에 전달할 때도 분리한 형태로 전달. 지금은 그냥 통으로 보내서 안됨.
     def _analyze_request(self, state: AgentState) -> AgentState:
         """
         사용자 요청을 분석하는 노드
@@ -110,29 +128,47 @@ class ProjectRecommendationAgent:
         user_message = messages[-1].content if messages else ""
         
         # 사용자 요청을 분석하여 구조화된 정보 추출
-        analysis_prompt = f"""
-        사용자의 프로젝트 요청을 분석하여 다음 정보를 추출해주세요:
-        
-        사용자 요청: {user_message}
-        
-        다음 형식으로 분석 결과를 제공해주세요:
-        1. 프로젝트 분야/도메인
-        2. 주요 키워드/태그
-        3. 필요한 역량/경험
-        4. 프로젝트 특성 (신규/개선/전략 등)
-        
-        분석 결과:
-        """
-        
-        # GPT를 사용한 요청 분석
-        response = self.llm.invoke([
-            SystemMessage(content="당신은 프로젝트 요청을 분석하는 전문가입니다."),
-            HumanMessage(content=analysis_prompt)
+        # Pydantic 파서 준비
+        parser = PydanticOutputParser(pydantic_object=RequestAnalysis)
+        format_instructions = parser.get_format_instructions()
+
+        # 프롬프트 구성 (구조화 출력 지시 포함)
+        prompt = PromptTemplate(
+            template=(
+                "다음 사용자 요청을 분석하여 주어진 스키마에 맞는 JSON을 생성하세요.\n"
+                "- project_characteristics: 프로젝트의 목적/분야/도메인 설명\n"
+                "- tags: 프로젝트 도메인/분야 태그 목록 (예: HR, 거시경제, 바이오)\n"
+                "- required_capabilities: 수행에 필요한 역량 설명\n\n"
+                "반드시 아래 형식 지침을 따르세요:\n{format_instructions}\n\n"
+                "사용자 요청:\n{user_request}"
+            ),
+            input_variables=["user_request"],
+            partial_variables={"format_instructions": format_instructions},
+        )
+
+        # LLM 호출 및 파싱
+        raw = self.llm.invoke([
+            SystemMessage(content="당신은 프로젝트 요청을 분석하여 구조화된 결과를 생성하는 전문가입니다."),
+            HumanMessage(content=prompt.format(user_request=user_message))
         ])
-        
+
+        # 파싱 시도 및 폴백
+        analysis: Dict[str, Any]
+        try:
+            parsed = parser.parse(raw.content)
+            analysis = parsed.model_dump()
+        except ValidationError:
+            # 최소 폴백: 전부 빈값/원문 기반 추론 불가 시 기본값
+            analysis = {
+                "project_characteristics": "",
+                "tags": [],
+                "required_capabilities": ""
+            }
+
         # 상태 업데이트
         state["user_request"] = user_message
-        state["messages"].append(response)
+        state["analysis"] = analysis
+        state["messages"].append(raw)
         
         return state
     
@@ -149,6 +185,7 @@ class ProjectRecommendationAgent:
             AgentState: 선별된 참여자들이 추가된 상태
         """
         user_request = state["user_request"]
+        analysis = state.get("analysis", {})
         all_participants = self.data_loader.get_all_participants()
         
         participant_scores = []
@@ -160,7 +197,7 @@ class ProjectRecommendationAgent:
             
             # 적합도 계산
             suitability = self.similarity_analyzer.calculate_participant_suitability(
-                user_request, participant, participant_projects
+                analysis, participant, participant_projects
             )
             
             # 임계값 이상인 경우만 포함 (FAISS 기반 점수에 맞게 조정)

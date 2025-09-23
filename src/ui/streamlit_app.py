@@ -164,7 +164,7 @@ def render_sidebar():
     # 데이터 동기화 (임베딩 → D:/vector_store)
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 🔄 데이터 동기화")
-    st.sidebar.caption("프로젝트 임베딩을 D:/vector_store 에 저장합니다.")
+    st.sidebar.caption("프로젝트 임베딩을 벡터 스토어 에 저장합니다.")
 
     # 진행 상태용 플레이스홀더
     sync_status = st.sidebar.empty()

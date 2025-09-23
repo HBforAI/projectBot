@@ -47,7 +47,7 @@ STREAMLIT_SERVER_ADDRESS = os.getenv("STREAMLIT_SERVER_ADDRESS", "localhost")
 PROJECT_DATA_PATH = "./Data/project_info.json"
 
 # 벡터 DB(FAISS) 영속 저장 디렉토리
-VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", "D:/vector_store")
+VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", "./Data/vector_store")
 VECTOR_COLLECTION_NAME = os.getenv("VECTOR_COLLECTION_NAME", "projects")
 
 # =============================================================================

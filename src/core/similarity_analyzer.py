@@ -317,6 +317,52 @@ class SimilarityAnalyzer:
             'overview': overview_similarity,
             'tags': tag_similarity
         }
+
+    def calculate_project_similarity_from_analysis(self, analysis: Dict[str, Any], project: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Pydantic 분석 결과(특성/태그/필요역량)에 기반한 유사도 계산
+        Returns keys: request_similarity, content_similarity, tag_similarity
+        """
+        if not analysis:
+            return {'request_similarity': 0.0, 'content_similarity': 0.0, 'tag_similarity': 0.0}
+
+        required_caps: str = analysis.get('required_capabilities', '') or ''
+        project_char: str = analysis.get('project_characteristics', '') or ''
+        req_tags: List[str] = analysis.get('tags', []) or []
+
+        project_overview = project.get('프로젝트개요', '') or ''
+        project_tags: List[str] = project.get('프로젝트태그', []) or []
+
+        # 1) 필요 역량 vs 프로젝트 개요
+        request_similarity = self.calculate_similarity(required_caps, project_overview) if required_caps and project_overview else 0.0
+
+        # 2) 프로젝트 특성 vs 프로젝트 개요
+        content_similarity = self.calculate_similarity(project_char, project_overview) if project_char and project_overview else 0.0
+
+        # 3) 태그 리스트 유사도 (요청 태그별로 프로젝트 태그와의 최대 유사도의 평균)
+        tag_similarity = 0.0
+        if req_tags and project_tags:
+            per_tag_scores: List[float] = []
+            for t in req_tags:
+                # 각 요청 태그 t에 대해 프로젝트 태그들과의 최대 유사도
+                if not t:
+                    continue
+                max_sim = 0.0
+                for pt in project_tags:
+                    if not pt:
+                        continue
+                    sim = self.calculate_similarity(str(t), str(pt))
+                    if sim > max_sim:
+                        max_sim = sim
+                per_tag_scores.append(max_sim)
+            if per_tag_scores:
+                tag_similarity = float(sum(per_tag_scores) / len(per_tag_scores))
+
+        return {
+            'request_similarity': float(request_similarity),
+            'content_similarity': float(content_similarity),
+            'tag_similarity': float(tag_similarity)
+        }
     
     def calculate_time_weight(self, project: Dict[str, Any]) -> float:
         """
@@ -356,7 +402,7 @@ class SimilarityAnalyzer:
             # 날짜 파싱 실패 시 기본 가중치 적용
             return 1.0
     
-    def calculate_participant_suitability(self, user_request: str, participant_name: str, 
+    def calculate_participant_suitability(self, analysis: Dict[str, Any], participant_name: str, 
                                         participant_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         특정 참여자의 적합도를 계산하는 메서드 (FAISS 기반)
@@ -385,12 +431,23 @@ class SimilarityAnalyzer:
         # FAISS 벡터 DB 확인 및 자동 동기화
         if not self._check_and_sync_vector_db():
             # 벡터 DB 동기화 실패 시 기존 방식으로 폴백
-            return self._calculate_participant_suitability_fallback(user_request, participant_name, participant_projects)
+            return self._calculate_participant_suitability_fallback(analysis, participant_name, participant_projects)
         
-        # FAISS 기반 유사도 검색
+            # FAISS 기반 유사도 검색 (후보 선별/초기 랭킹용)
         try:
-            # 사용자 요청으로 유사한 프로젝트 검색
-            similar_projects = self.search_similar_projects(user_request, k=100)
+            # 분석 결과를 기반으로 검색 질의 구성
+            query_parts: List[str] = []
+            req_caps = (analysis or {}).get('required_capabilities') or ''
+            proj_char = (analysis or {}).get('project_characteristics') or ''
+            tags = (analysis or {}).get('tags') or []
+            if req_caps:
+                query_parts.append(req_caps)
+            if proj_char:
+                query_parts.append(proj_char)
+            if tags:
+                query_parts.append(', '.join(tags))
+            query = '\n'.join(query_parts) if query_parts else ''
+            similar_projects = self.search_similar_projects(query, k=100) if query else []
             
             # 참여자가 참여한 프로젝트 중에서 매칭되는 것들 필터링
             # 프로젝트명으로 매칭 (더 안정적)
@@ -403,15 +460,20 @@ class SimilarityAnalyzer:
                     # 원본 프로젝트 데이터 찾기
                     for project in participant_projects:
                         if project.get('프로젝트명', '') == project_name:
+                            # 분석 기반 상세 유사도 및 가중치 점수 계산
+                            similarities = self.calculate_project_similarity_from_analysis(analysis, project)
+                            time_weight = self.calculate_time_weight(project)
+                            # 가중치 설정: request 0.5, content 0.25, tags 0.25
+                            project_score = (
+                                similarities['request_similarity'] * 0.5 +
+                                similarities['content_similarity'] * 0.25 +
+                                similarities['tag_similarity'] * 0.25
+                            ) * time_weight
                             matching_projects.append({
                                 'project': project,
-                                'score': score,
-                                'similarities': {
-                                    'title': score,  # FAISS에서 이미 종합 점수로 계산됨
-                                    'overview': score,
-                                    'tags': score
-                                },
-                                'time_weight': self.calculate_time_weight(project)
+                                'score': project_score,
+                                'similarities': similarities,
+                                'time_weight': time_weight
                             })
                             break
             
@@ -426,7 +488,7 @@ class SimilarityAnalyzer:
                     'reasons': ["관련 프로젝트 경험이 없습니다."]
                 }
             
-            # 점수 계산 및 정렬
+            # 점수 계산 및 정렬 (폴백과 동일한 방식으로 평균 산출)
             total_score = sum(match['score'] for match in matching_projects)
             avg_score = total_score / len(matching_projects)
             
@@ -459,7 +521,7 @@ class SimilarityAnalyzer:
             
         except Exception as e:
             print(f"⚠️ FAISS 기반 검색 실패, 폴백 방식 사용: {e}")
-            return self._calculate_participant_suitability_fallback(user_request, participant_name, participant_projects)
+            return self._calculate_participant_suitability_fallback(analysis, participant_name, participant_projects)
     
     def _check_and_sync_vector_db(self) -> bool:
         """
@@ -499,13 +561,32 @@ class SimilarityAnalyzer:
                 print(f"❌ 벡터 DB 동기화 중 오류 발생: {e}")
                 return False
     
-    def _calculate_participant_suitability_fallback(self, user_request: str, participant_name: str, 
+    def _calculate_participant_suitability_fallback(self, analysis: Dict[str, Any], participant_name: str, 
                                                   participant_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
         기존 방식으로 참여자 적합도를 계산하는 폴백 메서드
         
         FAISS가 사용 불가능할 때 기존의 임베딩 방식으로 계산합니다.
         """
+        # 1회 한정 재색인 시도 (무한루프 방지 플래그 사용)
+        try:
+            if not getattr(self, "_reindex_attempted", False):
+                self._reindex_attempted = True
+                # 인덱스 동기화 시도
+                doc_count = self.sync_vector_db()
+                if doc_count > 0:
+                    # 재색인 성공 시 동일 로직으로 재시도
+                    try:
+                        result = self.calculate_participant_suitability(analysis, participant_name, participant_projects)
+                        return result
+                    except Exception:
+                        # 재시도 실패 시 폴백 계속 진행
+                        pass
+        finally:
+            # 다음 호출에는 다시 시도할 수 있도록 리셋
+            if hasattr(self, "_reindex_attempted"):
+                self._reindex_attempted = False
+
         if not participant_projects:
             return {
                 'participant': participant_name,
@@ -521,19 +602,19 @@ class SimilarityAnalyzer:
         recent_score = 0.0
         recent_count = 0
         
-        # 각 프로젝트별로 유사도 계산 (기존 방식)
+        # 각 프로젝트별로 유사도 계산 (분석 기반)
         for project in participant_projects:
-            # 프로젝트별 유사도 계산
-            similarities = self.calculate_project_similarity(user_request, project)
+            # 프로젝트별 유사도 계산 (분석 기반)
+            similarities = self.calculate_project_similarity_from_analysis(analysis, project)
             
             # 시간 가중치 계산
             time_weight = self.calculate_time_weight(project)
             
             # 종합 점수 계산 (가중 평균)
             project_score = (
-                similarities['title'] * TITLE_WEIGHT +
-                similarities['overview'] * OVERVIEW_WEIGHT +
-                similarities['tags'] * TAG_WEIGHT
+                similarities['request_similarity'] * 0.5 +
+                similarities['content_similarity'] * 0.25 +
+                similarities['tag_similarity'] * 0.25
             ) * time_weight
             
             total_score += project_score
