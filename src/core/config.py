@@ -65,6 +65,9 @@ TAG_WEIGHT = 0.4      # 태그 매칭 가중치
 OVERVIEW_WEIGHT = 0.4 # 프로젝트 개요 매칭 가중치  
 TITLE_WEIGHT = 0.2    # 프로젝트명 매칭 가중치
 
+# 초기 FAISS 검색에서 가져올 유사 프로젝트 수 (k)
+INITIAL_FAISS_TOP_K = 30
+
 # =============================================================================
 # 유틸리티 함수
 # =============================================================================
@@ -105,5 +108,6 @@ def get_config_summary():
             "tag": TAG_WEIGHT,
             "overview": OVERVIEW_WEIGHT,
             "title": TITLE_WEIGHT
-        }
+        },
+        "initial_faiss_top_k": INITIAL_FAISS_TOP_K
     }

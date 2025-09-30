@@ -17,7 +17,7 @@ from typing import Dict, List, Any, Tuple
 import os
 from ..core.data_loader import ProjectDataLoader
 from ..core.similarity_analyzer import SimilarityAnalyzer
-from ..core.config import VECTOR_DB_DIR, VECTOR_COLLECTION_NAME
+from ..core.config import VECTOR_DB_DIR, VECTOR_COLLECTION_NAME, INITIAL_FAISS_TOP_K
 
 
 class ParticipantAnalyzer:
@@ -62,7 +62,7 @@ class ParticipantAnalyzer:
         # 2. FAISS 검색을 한 번만 수행 (가장 비용이 큰 작업)
         print("📊 FAISS 검색 수행 중...")
         similar_projects = self.similarity_analyzer.search_similar_projects(
-            self._build_search_query(analysis), k=30
+            self._build_search_query(analysis), k=INITIAL_FAISS_TOP_K
         )
         print(f"✅ FAISS 검색 완료: {len(similar_projects)}개 프로젝트 발견")
         

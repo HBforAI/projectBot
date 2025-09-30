@@ -183,7 +183,7 @@ class SimilarityAnalyzer:
             print(f"❌ FAISS 인덱스 생성 실패: {e}")
             return 0
 
-    def search_similar_projects(self, query: str, k: int = 30) -> List[Tuple[Dict[str, Any], float]]:
+    def search_similar_projects(self, query: str, k: int) -> List[Tuple[Dict[str, Any], float]]:
         """
         FAISS VectorDB에서 질의와 유사한 프로젝트를 상위 k개 반환합니다.
         Returns: [(project_metadata, score), ...]
