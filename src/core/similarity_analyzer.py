@@ -181,7 +181,7 @@ class SimilarityAnalyzer:
             print(f"❌ FAISS 인덱스 생성 실패: {e}")
             return 0
 
-    def search_similar_projects(self, query: str, k: int = 100) -> List[Tuple[Dict[str, Any], float]]:
+    def search_similar_projects(self, query: str, k: int = 30) -> List[Tuple[Dict[str, Any], float]]:
         """
         FAISS VectorDB에서 질의와 유사한 프로젝트를 상위 k개 반환합니다.
         Returns: [(project_metadata, score), ...]
@@ -405,15 +405,15 @@ class SimilarityAnalyzer:
     def calculate_participant_suitability(self, analysis: Dict[str, Any], participant_name: str, 
                                         participant_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        특정 참여자의 적합도를 계산하는 메서드 (FAISS 기반)
+        특정 참여자의 적합도를 계산하는 메서드
         
-        이 메서드는 FAISS 벡터 DB를 활용하여 효율적으로 참여자의 적합도를 계산합니다.
-        벡터 DB가 없으면 자동으로 동기화를 실행합니다.
+        이 메서드는 전달받은 프로젝트들에 대해 유사도를 계산합니다.
+        FAISS 검색은 ParticipantAnalyzer에서 이미 수행된 결과를 사용합니다.
         
         Args:
-            user_request (str): 사용자의 프로젝트 요청 내용
+            analysis (Dict[str, Any]): 사용자 요청 분석 결과
             participant_name (str): 참여자 이름
-            participant_projects (List[Dict[str, Any]]): 참여자의 프로젝트 리스트
+            participant_projects (List[Dict[str, Any]]): 참여자의 프로젝트 리스트 (이미 필터링됨)
             
         Returns:
             Dict[str, Any]: 참여자의 적합도 분석 결과
@@ -428,54 +428,28 @@ class SimilarityAnalyzer:
                 'reasons': []
             }
         
-        # FAISS 벡터 DB 확인 및 자동 동기화
-        if not self._check_and_sync_vector_db():
-            # 벡터 DB 동기화 실패 시 기존 방식으로 폴백
-            return self._calculate_participant_suitability_fallback(analysis, participant_name, participant_projects)
-        
-            # FAISS 기반 유사도 검색 (후보 선별/초기 랭킹용)
+        # 전달받은 프로젝트들에 대해서만 유사도 계산
+        # (FAISS 검색은 ParticipantAnalyzer에서 이미 수행됨)
         try:
-            # 분석 결과를 기반으로 검색 질의 구성
-            query_parts: List[str] = []
-            req_caps = (analysis or {}).get('required_capabilities') or ''
-            proj_char = (analysis or {}).get('project_characteristics') or ''
-            tags = (analysis or {}).get('tags') or []
-            if req_caps:
-                query_parts.append(req_caps)
-            if proj_char:
-                query_parts.append(proj_char)
-            if tags:
-                query_parts.append(', '.join(tags))
-            query = '\n'.join(query_parts) if query_parts else ''
-            similar_projects = self.search_similar_projects(query, k=100) if query else []
-            
-            # 참여자가 참여한 프로젝트 중에서 매칭되는 것들 필터링
-            # 프로젝트명으로 매칭 (더 안정적)
-            participant_project_names = {project.get('프로젝트명', '') for project in participant_projects}
             matching_projects = []
             
-            for meta, score in similar_projects:
-                project_name = meta.get('project_name', '')
-                if project_name in participant_project_names:
-                    # 원본 프로젝트 데이터 찾기
-                    for project in participant_projects:
-                        if project.get('프로젝트명', '') == project_name:
-                            # 분석 기반 상세 유사도 및 가중치 점수 계산
-                            similarities = self.calculate_project_similarity_from_analysis(analysis, project)
-                            time_weight = self.calculate_time_weight(project)
-                            # 가중치 설정: request 0.5, content 0.25, tags 0.25
-                            project_score = (
-                                similarities['request_similarity'] * 0.5 +
-                                similarities['content_similarity'] * 0.25 +
-                                similarities['tag_similarity'] * 0.25
-                            ) * time_weight
-                            matching_projects.append({
-                                'project': project,
-                                'score': project_score,
-                                'similarities': similarities,
-                                'time_weight': time_weight
-                            })
-                            break
+            # 전달받은 프로젝트들에 대해 직접 유사도 계산
+            for project in participant_projects:
+                # 분석 기반 상세 유사도 및 가중치 점수 계산
+                similarities = self.calculate_project_similarity_from_analysis(analysis, project)
+                time_weight = self.calculate_time_weight(project)
+                # 가중치 설정: request 0.5, content 0.25, tags 0.25
+                project_score = (
+                    similarities['request_similarity'] * 0.5 +
+                    similarities['content_similarity'] * 0.25 +
+                    similarities['tag_similarity'] * 0.25
+                ) * time_weight
+                matching_projects.append({
+                    'project': project,
+                    'score': project_score,
+                    'similarities': similarities,
+                    'time_weight': time_weight
+                })
             
             if not matching_projects:
                 return {
@@ -506,8 +480,8 @@ class SimilarityAnalyzer:
             matching_projects.sort(key=lambda x: x['score'], reverse=True)
             best_matches = matching_projects[:3]
             
-            # 추천 이유 생성
-            reasons = self._generate_recommendation_reasons(participant_name, best_matches, recent_avg_score)
+            # 추천 이유 생성 (전체 매칭 목록을 전달하여 유사도 기준 상위 3개 산출)
+            reasons = self._generate_recommendation_reasons(participant_name, matching_projects, recent_avg_score, analysis)
             
             return {
                 'participant': participant_name,
@@ -520,46 +494,9 @@ class SimilarityAnalyzer:
             }
             
         except Exception as e:
-            print(f"⚠️ FAISS 기반 검색 실패, 폴백 방식 사용: {e}")
+            print(f"⚠️ FAISS 기반 검색 실패, 폴백 방식 사용을 시도해보겠습니다. 오류 내용: {e}")
             return self._calculate_participant_suitability_fallback(analysis, participant_name, participant_projects)
     
-    def _check_and_sync_vector_db(self) -> bool:
-        """
-        FAISS 벡터 DB가 존재하는지 확인하고, 없으면 자동으로 동기화를 실행합니다.
-        
-        Returns:
-            bool: 벡터 DB가 사용 가능하면 True, 아니면 False
-        """
-        # 벡터 DB가 이미 로드되어 있는지 확인
-        if self._vector_store is not None:
-            return True
-        
-        # 파일 존재 확인
-        faiss_path = os.path.join(VECTOR_DB_DIR, f"{VECTOR_COLLECTION_NAME}.faiss")
-        metadata_path = os.path.join(VECTOR_DB_DIR, f"{VECTOR_COLLECTION_NAME}.pkl")
-        
-        if os.path.exists(faiss_path) and os.path.exists(metadata_path):
-            # 파일이 있으면 로드 시도
-            try:
-                self._load_faiss_index()
-                return self._vector_store is not None
-            except Exception as e:
-                print(f"⚠️ 기존 벡터 DB 로드 실패: {e}")
-                return False
-        else:
-            # 파일이 없으면 자동 동기화 실행
-            print("🔄 FAISS 벡터 DB가 없습니다. 자동으로 동기화를 시작합니다...")
-            try:
-                doc_count = self.sync_vector_db()
-                if doc_count > 0:
-                    print(f"✅ 벡터 DB 동기화 완료: {doc_count}개 문서 저장")
-                    return True
-                else:
-                    print("❌ 벡터 DB 동기화 실패")
-                    return False
-            except Exception as e:
-                print(f"❌ 벡터 DB 동기화 중 오류 발생: {e}")
-                return False
     
     def _calculate_participant_suitability_fallback(self, analysis: Dict[str, Any], participant_name: str, 
                                                   participant_projects: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -581,6 +518,7 @@ class SimilarityAnalyzer:
                         return result
                     except Exception:
                         # 재시도 실패 시 폴백 계속 진행
+                        print(f"벡터 DB 인덱싱 재시도 실패. fallback 진행")
                         pass
         finally:
             # 다음 호출에는 다시 시도할 수 있도록 리셋
@@ -638,8 +576,8 @@ class SimilarityAnalyzer:
         project_scores.sort(key=lambda x: x['score'], reverse=True)
         best_matches = project_scores[:3]  # 상위 3개
         
-        # 추천 이유 생성
-        reasons = self._generate_recommendation_reasons(participant_name, best_matches, recent_avg_score)
+        # 추천 이유 생성 (전체 프로젝트 점수 목록 전달)
+        reasons = self._generate_recommendation_reasons(participant_name, project_scores, recent_avg_score, analysis)
         
         return {
             'participant': participant_name,
@@ -651,103 +589,86 @@ class SimilarityAnalyzer:
             'reasons': reasons
         }
 
-    def _generate_recommendation_reasons(self, participant_name: str, best_matches: List[Dict], 
-                                       recent_score: float) -> List[str]:
+    def _generate_recommendation_reasons(self, participant_name: str, matches: List[Dict], 
+                                       recent_score: float, analysis: Dict[str, Any]) -> List[str]:
         """
-        추천 이유를 생성하는 내부 메서드
+        추천 이유를 생성하는 내부 메서드 (request/content/tag 기반)
         
-        이 메서드는 참여자의 프로젝트 경험을 분석하여
-        왜 해당 인원이 적합한지에 대한 구체적인 이유를 생성합니다.
+        이 메서드는 참여자의 프로젝트 경험을 분석하여 왜 해당 인원이 적합한지에 대한
+        구체적인 이유를 생성합니다. 유사도는 다음 세 가지 기준으로만 사용합니다.
+        - request_similarity: 필요 역량 vs 프로젝트 개요
+        - content_similarity: 프로젝트 특성(원하는 과제) vs 프로젝트 개요
+        - tag_similarity: 요청 태그 vs 프로젝트 태그
         
         Args:
             participant_name (str): 참여자 이름
-            best_matches (List[Dict]): 상위 매칭 프로젝트들
+            matches (List[Dict]): 매칭된 프로젝트들 (각 항목은 {'project','score','similarities','time_weight'})
             recent_score (float): 최근 프로젝트 점수
+            analysis (Dict[str, Any]): 사용자 요청 분석 결과
             
         Returns:
             List[str]: 추천 이유 리스트
         """
-        reasons = []
-        
-        if not best_matches:
+        reasons: List[str] = []
+        if not matches:
             return ["관련 프로젝트 경험이 없습니다."]
-        
-        # 1. 최고 매칭 프로젝트 기반 상세 이유
-        best_match = best_matches[0]
-        project = best_match['project']
-        score = best_match['score']
-        similarities = best_match['similarities']
-        
-        # 프로젝트명 관련성 분석
-        if similarities['title'] > 0.6:
-            reasons.append(f"🎯 **프로젝트명 유사도 높음**: '{project['프로젝트명']}' 프로젝트와 직접적인 관련성이 있습니다.")
-        elif similarities['title'] > 0.4:
-            reasons.append(f"📋 **프로젝트명 부분 매칭**: '{project['프로젝트명']}' 프로젝트와 일부 관련성이 있습니다.")
-        
-        # 프로젝트 개요 관련성 분석
-        if similarities['overview'] > 0.7:
-            reasons.append(f"📝 **프로젝트 내용 높은 일치**: '{project['프로젝트개요'][:50]}...' 내용과 매우 유사한 경험을 보유합니다.")
-        elif similarities['overview'] > 0.5:
-            reasons.append(f"📄 **프로젝트 내용 부분 일치**: '{project['프로젝트개요'][:50]}...' 내용과 관련된 경험이 있습니다.")
-        
-        # 태그 매칭 상세 분석
-        if similarities['tags'] > 0.6:
-            project_tags = project.get('프로젝트태그', [])
-            if project_tags:
-                reasons.append(f"🏷️ **전문 분야 일치**: '{', '.join(project_tags[:4])}' 분야에서 전문성을 보유하고 있습니다.")
-        elif similarities['tags'] > 0.4:
-            project_tags = project.get('프로젝트태그', [])
-            if project_tags:
-                reasons.append(f"🔖 **관련 분야 경험**: '{', '.join(project_tags[:3])}' 분야와 관련된 경험이 있습니다.")
-        
-        # 2. 프로젝트 기간 및 최근성 분석
-        project_period = project.get('프로젝트기간', '')
-        if project_period:
-            try:
-                end_date_str = project_period.split(' ~ ')[-1]
-                if end_date_str:
-                    end_date = datetime.strptime(end_date_str, '%Y.%m')
-                    current_date = datetime.now()
-                    months_diff = (current_date.year - end_date.year) * 12 + (current_date.month - end_date.month)
-                    
-                    if months_diff <= 6:
-                        reasons.append(f"⏰ **최근 경험**: {project_period}에 완료된 최근 프로젝트 경험을 보유합니다.")
-                    elif months_diff <= 12:
-                        reasons.append(f"📅 **1년 이내 경험**: {project_period}에 완료된 프로젝트 경험을 보유합니다.")
-                    else:
-                        reasons.append(f"📆 **과거 경험**: {project_period}에 완료된 프로젝트 경험을 보유합니다.")
-            except:
-                reasons.append(f"📅 **프로젝트 기간**: {project_period}에 참여한 경험이 있습니다.")
-        
-        # 3. 다중 프로젝트 경험 분석
-        if len(best_matches) >= 2:
-            second_match = best_matches[1]
-            second_project = second_match['project']
-            reasons.append(f"🔄 **다양한 관련 경험**: '{second_project['프로젝트명']}' 등 총 {len(best_matches)}개의 관련 프로젝트에 참여했습니다.")
-        
-        # 4. 최근 활동도 분석
+
+        # 분석 텍스트
+        required_caps: str = (analysis or {}).get('required_capabilities') or ''
+        project_char: str = (analysis or {}).get('project_characteristics') or ''
+
+        # 정렬을 위한 안전한 키 접근 헬퍼
+        def sim_val(item: Dict[str, Any], key: str) -> float:
+            sims = item.get('similarities', {}) or {}
+            return float(sims.get(key, 0.0))
+
+        # 1) request_similarity 상위 3개
+        top_req = sorted(matches, key=lambda m: sim_val(m, 'request_similarity'), reverse=True)[:3]
+        if top_req and sim_val(top_req[0], 'request_similarity') > 0.0:
+            req_projects = [m['project'].get('프로젝트명', '') for m in top_req if m.get('project')]
+            req_projects = [p for p in req_projects if p]
+            if required_caps and req_projects:
+                reasons.append(
+                    f"🧩 필요 역량 일치: '{required_caps}...' 요구에 대해 "
+                    f"{', '.join(req_projects)} 프로젝트 경험으로 적합합니다."
+                )
+            elif req_projects:
+                reasons.append(
+                    f"🧩 필요 역량 일치: {', '.join(req_projects)} 프로젝트 경험으로 요구 사항과 높은 관련성을 보입니다."
+                )
+
+        # 2) content_similarity 상위 3개
+        top_content = sorted(matches, key=lambda m: sim_val(m, 'content_similarity'), reverse=True)[:3]
+        if top_content and sim_val(top_content[0], 'content_similarity') > 0.0:
+            cont_projects = [m['project'].get('프로젝트명', '') for m in top_content if m.get('project')]
+            cont_projects = [p for p in cont_projects if p]
+            if project_char and cont_projects:
+                reasons.append(
+                    f"📝 과제 적합성: 사용자가 원하는 과제 '{project_char}...'에 대해 "
+                    f"{', '.join(cont_projects)} 프로젝트 수행 경험으로 적합합니다."
+                )
+            elif cont_projects:
+                reasons.append(
+                    f"📝 과제 적합성: {', '.join(cont_projects)} 프로젝트 수행 경험이 요청 과제와 높은 관련성을 보입니다."
+                )
+
+        # 3) tag_similarity 상위 3개의 태그 모음
+        top_tag = sorted(matches, key=lambda m: sim_val(m, 'tag_similarity'), reverse=True)[:3]
+        collected_tags: List[str] = []
+        for m in top_tag:
+            proj = m.get('project') or {}
+            tags = proj.get('프로젝트태그', []) or []
+            for t in tags:
+                if t and t not in collected_tags:
+                    collected_tags.append(t)
+        if collected_tags:
+            display_tags = ', '.join(collected_tags[:10])
+            reasons.append(f"🏷️ 태그 기반 전문성: {display_tags}")
+
+        # 4) 최근 활동도 간단 표기
         if recent_score > 0.6:
-            reasons.append("🚀 **높은 최근 활동도**: 최근 6개월 내 관련 프로젝트에서 뛰어난 성과를 보였습니다.")
+            reasons.append("🚀 최근 관련 프로젝트에서 높은 성과를 보였습니다.")
         elif recent_score > 0.4:
-            reasons.append("📈 **활발한 최근 활동**: 최근 1년 내 관련 프로젝트에 활발히 참여했습니다.")
-        
-        # 5. 전체 프로젝트 참여 경험
-        total_projects = len([m for m in best_matches if m['score'] > 0.3])
-        if total_projects >= 5:
-            reasons.append(f"💼 **풍부한 프로젝트 경험**: 총 {total_projects}개 이상의 관련 프로젝트에 참여한 풍부한 경험을 보유합니다.")
-        elif total_projects >= 3:
-            reasons.append(f"🎯 **충분한 프로젝트 경험**: {total_projects}개의 관련 프로젝트에 참여한 경험이 있습니다.")
-        
-        # 6. 점수 기반 종합 평가
-        if score > 0.8:
-            reasons.append("⭐ **매우 높은 적합도**: 요청하신 프로젝트와 매우 높은 관련성을 보입니다.")
-        elif score > 0.6:
-            reasons.append("✅ **높은 적합도**: 요청하신 프로젝트와 높은 관련성을 보입니다.")
-        elif score > 0.4:
-            reasons.append("👍 **적절한 적합도**: 요청하신 프로젝트와 적절한 관련성을 보입니다.")
-        
-        # 7. 특별한 강점이 있는 경우
-        if similarities['title'] > 0.7 and similarities['overview'] > 0.7:
-            reasons.append("🎖️ **전문성 인증**: 프로젝트명과 내용 모두에서 높은 일치도를 보이는 전문성을 인정받습니다.")
-        
+            reasons.append("📈 최근 1년 내 관련 프로젝트에 활발히 참여했습니다.")
+
         return reasons

@@ -6,19 +6,16 @@ LangGraph 기반 프로젝트 인원 추천 에이전트
 사용자의 프로젝트 요청을 분석하고 적합한 인원을 추천하는 전체 워크플로우를 관리합니다.
 
 주요 기능:
+- LangGraph 워크플로우 관리
 - 사용자 요청 분석 및 구조화
 - 참여자 탐색 및 적합도 계산
 - 추천 결과 생성 및 포맷팅
-- LangGraph 워크플로우 관리
 
 작성자: AI Assistant
-버전: 1.0.0
+버전: 2.0.0
 """
 
 from typing import Dict, List, Any, TypedDict, Annotated
-from pydantic import BaseModel, Field, ValidationError
-from langchain.output_parsers import PydanticOutputParser
-from langchain.prompts import PromptTemplate
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
@@ -27,6 +24,8 @@ from langgraph.graph.message import add_messages
 from ..core.data_loader import ProjectDataLoader
 from ..core.similarity_analyzer import SimilarityAnalyzer
 from ..core.config import OPENAI_API_KEY
+from .request_analyzer import RequestAnalyzer
+from .participant_analyzer import ParticipantAnalyzer
 
 class AgentState(TypedDict):
     """
@@ -40,18 +39,6 @@ class AgentState(TypedDict):
     analysis_complete: bool                  # 분석 완료 여부
     analysis: Dict[str, Any]                 # 구조화된 분석 결과
 
-class RequestAnalysis(BaseModel):
-    """사용자 요청 분석 결과 (구조화)"""
-    project_characteristics: str = Field(
-        description="프로젝트의 목적과 분야, 그리고 도메인은 무엇인지에 대한 설명"
-    )
-    tags: List[str] = Field(
-        default_factory=list,
-        description="프로젝트의 도메인/분야를 나타내는 태그 목록 (예: HR, 거시경제, 바이오)"
-    )
-    required_capabilities: str = Field(
-        description="프로젝트 수행을 위해 필요해 보이는 역량에 대한 설명"
-    )
 
 class ProjectRecommendationAgent:
     """
@@ -84,6 +71,10 @@ class ProjectRecommendationAgent:
         self.data_loader = ProjectDataLoader()
         self.similarity_analyzer = SimilarityAnalyzer()
         
+        # 분석기 초기화
+        self.request_analyzer = RequestAnalyzer(self.llm)
+        self.participant_analyzer = ParticipantAnalyzer(self.data_loader, self.similarity_analyzer)
+        
         # LangGraph 워크플로우 구성
         self.graph = self._build_graph()
     
@@ -111,12 +102,9 @@ class ProjectRecommendationAgent:
         
         return workflow.compile()
     
-    # TODO: 이거 Output Extraction 통해서 1~4번 다 분리해서 받고, calculate_participant_suitability 함수에 전달할 때도 분리한 형태로 전달. 지금은 그냥 통으로 보내서 안됨.
     def _analyze_request(self, state: AgentState) -> AgentState:
         """
         사용자 요청을 분석하는 노드
-        
-        사용자의 프로젝트 요청을 분석하여 구조화된 정보를 추출합니다.
         
         Args:
             state (AgentState): 현재 에이전트 상태
@@ -127,48 +115,13 @@ class ProjectRecommendationAgent:
         messages = state["messages"]
         user_message = messages[-1].content if messages else ""
         
-        # 사용자 요청을 분석하여 구조화된 정보 추출
-        # Pydantic 파서 준비
-        parser = PydanticOutputParser(pydantic_object=RequestAnalysis)
-        format_instructions = parser.get_format_instructions()
-
-        # 프롬프트 구성 (구조화 출력 지시 포함)
-        prompt = PromptTemplate(
-            template=(
-                "다음 사용자 요청을 분석하여 주어진 스키마에 맞는 JSON을 생성하세요.\n"
-                "- project_characteristics: 프로젝트의 목적/분야/도메인 설명\n"
-                "- tags: 프로젝트 도메인/분야 태그 목록 (예: HR, 거시경제, 바이오)\n"
-                "- required_capabilities: 수행에 필요한 역량 설명\n\n"
-                "반드시 아래 형식 지침을 따르세요:\n{format_instructions}\n\n"
-                "사용자 요청:\n{user_request}"
-            ),
-            input_variables=["user_request"],
-            partial_variables={"format_instructions": format_instructions},
-        )
-
-        # LLM 호출 및 파싱
-        raw = self.llm.invoke([
-            SystemMessage(content="당신은 프로젝트 요청을 분석하여 구조화된 결과를 생성하는 전문가입니다."),
-            HumanMessage(content=prompt.format(user_request=user_message))
-        ])
-
-        # 파싱 시도 및 폴백
-        analysis: Dict[str, Any]
-        try:
-            parsed = parser.parse(raw.content)
-            analysis = parsed.model_dump()
-        except ValidationError:
-            # 최소 폴백: 전부 빈값/원문 기반 추론 불가 시 기본값
-            analysis = {
-                "project_characteristics": "",
-                "tags": [],
-                "required_capabilities": ""
-            }
-
+        # 요청 분석기 사용
+        analysis = self.request_analyzer.analyze_request(user_message)
+        
         # 상태 업데이트
         state["user_request"] = user_message
         state["analysis"] = analysis
-        state["messages"].append(raw)
+        state["messages"].append(HumanMessage(content=f"요청 분석 완료: {analysis.get('project_characteristics', '')[:50]}..."))
         
         return state
     
@@ -176,46 +129,26 @@ class ProjectRecommendationAgent:
         """
         적합한 참여자를 찾는 노드
         
-        모든 참여자를 대상으로 적합도를 계산하고 임계값 이상인 참여자들을 선별합니다.
-        
         Args:
             state (AgentState): 현재 에이전트 상태
             
         Returns:
             AgentState: 선별된 참여자들이 추가된 상태
         """
-        user_request = state["user_request"]
         analysis = state.get("analysis", {})
-        all_participants = self.data_loader.get_all_participants()
         
-        participant_scores = []
+        # 참여자 분석기 사용
+        recommendations = self.participant_analyzer.find_suitable_participants(analysis)
         
-        # 모든 참여자에 대해 적합도 계산
-        for participant in all_participants:
-            # 참여자의 프로젝트들 가져오기
-            participant_projects = self.data_loader.get_projects_by_participant(participant)
-            
-            # 적합도 계산
-            suitability = self.similarity_analyzer.calculate_participant_suitability(
-                analysis, participant, participant_projects
-            )
-            
-            # 임계값 이상인 경우만 포함 (FAISS 기반 점수에 맞게 조정)
-            if suitability['total_score'] >= 0.01:  # 매우 낮은 임계값으로 필터링
-                participant_scores.append(suitability)
+        # 상태 업데이트
+        state["recommendations"] = recommendations
+        state["messages"].append(HumanMessage(content=f"참여자 분석 완료: {len(recommendations)}명 선별"))
         
-        # 점수 기준으로 정렬
-        participant_scores.sort(key=lambda x: x['total_score'], reverse=True)
-        
-        # 상위 10명만 선택
-        state["recommendations"] = participant_scores[:10]
         return state
     
     def _generate_recommendations(self, state: AgentState) -> AgentState:
         """
         추천 결과를 생성하고 정리하는 노드
-        
-        선별된 참여자들에 대한 상세한 추천 정보를 생성합니다.
         
         Args:
             state (AgentState): 현재 에이전트 상태
@@ -231,11 +164,10 @@ class ProjectRecommendationAgent:
             )
             return state
         
-        # 상위 5명만 선택
+        # 상위 5명만 선택하고 상세 정보 정리
         top_recommendations = recommendations[:5]
-        
-        # 각 추천에 대한 상세 분석
         detailed_recommendations = []
+        
         for rec in top_recommendations:
             detailed_rec = {
                 'participant': rec['participant'],
@@ -251,14 +183,13 @@ class ProjectRecommendationAgent:
         # 상태 업데이트
         state["recommendations"] = detailed_recommendations
         state["analysis_complete"] = True
+        state["messages"].append(HumanMessage(content=f"추천 결과 생성 완료: {len(detailed_recommendations)}명"))
         
         return state
     
     def _format_response(self, state: AgentState) -> AgentState:
         """
         최종 응답을 포맷팅하는 노드
-        
-        추천 결과를 사용자에게 보여줄 수 있는 형태로 포맷팅합니다.
         
         Args:
             state (AgentState): 현재 에이전트 상태
@@ -299,9 +230,10 @@ class ProjectRecommendationAgent:
         
         # 최종 응답을 상태에 추가
         state["messages"].append(HumanMessage(content=response_text))
+        state["messages"].append(HumanMessage(content="추천 완료! 추가 질문이 있으시면 언제든 말씀해 주세요."))
         return state
     
-    def process_request(self, user_input: str, timeout_sec: int = 600) -> Dict[str, Any]:
+    def process_request(self, user_input: str, timeout_sec: int = 900) -> Dict[str, Any]:
         """
         사용자 요청을 처리하는 메인 메서드
         
@@ -336,7 +268,7 @@ class ProjectRecommendationAgent:
                 }
             except FuturesTimeoutError:
                 return {
-                    "response": "⏱️ 처리 시간이 10분을 초과하여 요청을 취소했습니다. 입력을 간소화하거나 다시 시도해 주세요.",
+                    "response": "⏱️ 처리 시간이 15분을 초과하여 요청을 취소했습니다. 입력을 간소화하거나 다시 시도해 주세요.",
                     "recommendations": []
                 }
 

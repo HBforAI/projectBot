@@ -286,11 +286,10 @@ def render_recommendation_page():
                         result = agent.process_request(user_input)
                         recommendations = result["recommendations"]
                         
-                        # 디버깅 정보 출력
-                        st.markdown("### 🔍 디버깅 정보")
-                        st.write(f"**전체 결과 키들:** {list(result.keys())}")
-                        st.write(f"**추천 수:** {len(recommendations)}")
-                        st.write(f"**분석 완료:** {result.get('analysis_complete', 'N/A')}")
+                        # # 디버깅 정보 출력: 출력 될 필요 없음
+                        # st.write(f"**전체 결과 키들:** {list(result.keys())}")
+                        # st.write(f"**추천 수:** {len(recommendations)}")
+                        # st.write(f"**분석 완료:** {result.get('analysis_complete', 'N/A')}")
                         
                         if recommendations:
                             st.write("**추천 결과 상세:**")
