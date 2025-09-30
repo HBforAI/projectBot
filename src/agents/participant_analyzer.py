@@ -77,12 +77,12 @@ class ParticipantAnalyzer:
         
         participant_scores = []
         
-        # 4. 선별된 참여자만 상세 계산 (매칭된 프로젝트만 사용)
+        # 4. 선별된 참여자만 상세 계산
         for i, (participant, matching_projects) in enumerate(matching_participants_with_projects.items()):
             print(f"📈 참여자 {i+1}/{len(matching_participants_with_projects)}: {participant} 분석 중...")
             print(f"   📋 매칭된 프로젝트: {len(matching_projects)}개")
             
-            # 적합도 계산 (매칭된 프로젝트만 사용)
+            # 적합도 계산 (SimilarityAnalyzer 내부 캐시 사용)
             suitability = self.similarity_analyzer.calculate_participant_suitability(
                 analysis, participant, matching_projects
             )

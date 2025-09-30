@@ -54,6 +54,8 @@ class SimilarityAnalyzer:
         self._st_model = None
         self._vector_store = None
         self._metadata_store = None
+        # 프로젝트-분석 캐시: (project_key, analysis_hash) -> {similarities, time_weight, score}
+        self._project_similarity_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # OpenAI embeddings만 사용 (폴백 제거)
         try:
@@ -433,22 +435,14 @@ class SimilarityAnalyzer:
         try:
             matching_projects = []
             
-            # 전달받은 프로젝트들에 대해 직접 유사도 계산
+            # 전달받은 프로젝트들에 대해 캐시 기반 유사도 계산
             for project in participant_projects:
-                # 분석 기반 상세 유사도 및 가중치 점수 계산
-                similarities = self.calculate_project_similarity_from_analysis(analysis, project)
-                time_weight = self.calculate_time_weight(project)
-                # 가중치 설정: request 0.5, content 0.25, tags 0.25
-                project_score = (
-                    similarities['request_similarity'] * 0.5 +
-                    similarities['content_similarity'] * 0.25 +
-                    similarities['tag_similarity'] * 0.25
-                ) * time_weight
+                cached = self._get_cached_project_similarity(analysis, project)
                 matching_projects.append({
                     'project': project,
-                    'score': project_score,
-                    'similarities': similarities,
-                    'time_weight': time_weight
+                    'score': cached['score'],
+                    'similarities': cached['similarities'],
+                    'time_weight': cached['time_weight']
                 })
             
             if not matching_projects:
@@ -496,6 +490,54 @@ class SimilarityAnalyzer:
         except Exception as e:
             print(f"⚠️ FAISS 기반 검색 실패, 폴백 방식 사용을 시도해보겠습니다. 오류 내용: {e}")
             return self._calculate_participant_suitability_fallback(analysis, participant_name, participant_projects)
+
+    def _get_project_key(self, project: Dict[str, Any]) -> str:
+        """
+        캐시 키 생성을 위한 프로젝트 식별자 반환 (프로젝트명 기반)
+        """
+        return str(project.get('프로젝트명', '') or '')
+
+    def _get_analysis_hash(self, analysis: Dict[str, Any]) -> str:
+        """
+        분석 결과를 해시하여 캐시 키 구성에 사용
+        """
+        import hashlib
+        if not analysis:
+            return 'empty'
+        # 항목을 정렬하여 안정적인 해시 생성
+        analysis_str = str(sorted(analysis.items()))
+        return hashlib.md5(analysis_str.encode('utf-8')).hexdigest()[:12]
+
+    def _get_cached_project_similarity(self, analysis: Dict[str, Any], project: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        프로젝트-분석 쌍에 대한 유사도 계산을 캐시로 재사용.
+        반환 형식: { 'similarities': Dict[str,float], 'time_weight': float, 'score': float }
+        """
+        project_key = self._get_project_key(project)
+        analysis_hash = self._get_analysis_hash(analysis)
+        cache_key = (project_key, analysis_hash)
+        cached = self._project_similarity_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        # 미캐시 시 계산
+        similarities = self.calculate_project_similarity_from_analysis(analysis, project)
+        time_weight = self.calculate_time_weight(project)
+        project_score = (
+            similarities['request_similarity'] * 0.5 +
+            similarities['content_similarity'] * 0.25 +
+            similarities['tag_similarity'] * 0.25
+        ) * time_weight
+        result = {
+            'similarities': similarities,
+            'time_weight': time_weight,
+            'score': project_score,
+        }
+        self._project_similarity_cache[cache_key] = result
+        return result
+
+    def clear_similarity_cache(self) -> None:
+        """프로젝트-분석 유사도 캐시를 비웁니다."""
+        self._project_similarity_cache.clear()
     
     
     def _calculate_participant_suitability_fallback(self, analysis: Dict[str, Any], participant_name: str, 
